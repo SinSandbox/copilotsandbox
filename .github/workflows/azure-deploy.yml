@@ -1,0 +1,166 @@
+name: CI/CD: Build, test and promote (Bicep)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AZURE_RESOURCE_GROUP: 'copilotsandbox-rg'
+  AZURE_LOCATION: 'eastus'
+  WEBAPP_BASE_NAME: 'copilotsandbox-${{ github.run_number }}'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - name: Install dependencies
+        run: npm ci
+      - name: Create package zip
+        run: |
+          zip -r package.zip . -x .git/**\* .github/**\* node_modules/**\* data/**\* package.zip
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-package
+          path: package.zip
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run unit tests
+        run: |
+          if npm test; then echo 'unit tests passed'; else echo 'unit tests failed' ; exit 1; fi
+
+  deploy-dev:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-package
+          path: .
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Ensure resource group exists
+        run: az group create --name ${{ env.AZURE_RESOURCE_GROUP }} --location ${{ env.AZURE_LOCATION }}
+      - name: Deploy Bicep template for dev
+        run: az deployment group create --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --template-file infra/main.bicep --parameters @infra/dev.parameters.json
+      - name: Deploy app via zip to dev
+        run: |
+          WEBAPP_NAME=$(python -c "import json,sys; print(json.load(open('infra/dev.parameters.json'))['parameters']['webAppName']['value'])")
+          az webapp deployment source config-zip --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --name "$WEBAPP_NAME" --src package.zip
+      - name: Validate dev endpoint
+        run: |
+          WEBAPP_NAME=$(python -c "import json,sys; print(json.load(open('infra/dev.parameters.json'))['parameters']['webAppName']['value'])")
+          host="${WEBAPP_NAME}.azurewebsites.net"
+          echo "Waiting for https://$host to become healthy..."
+          for i in {1..15}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "https://$host" || echo 000)
+            echo "HTTP $status"
+            if [ "$status" -eq 200 ]; then echo "dev healthy"; exit 0; fi
+            sleep 5
+          done
+          echo "dev validation failed"; exit 1
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    steps:
+      - name: Run integration checks against dev
+        run: |
+          WEBAPP_NAME=$(python -c "import json,sys; print(json.load(open('infra/dev.parameters.json'))['parameters']['webAppName']['value'])")
+          host="${WEBAPP_NAME}.azurewebsites.net"
+          echo "Posting test payload to https://$host/submit"
+          resp=$(curl -sS -X POST "https://$host/submit" -H 'Content-Type: application/json' -d '{"name":"ci-test","email":"ci@example.com","message":"ci"}' || true)
+          echo "Response: $resp"
+          if echo "$resp" | grep -q '"success":true'; then echo "integration ok"; else echo "integration failed"; exit 1; fi
+
+  deploy-test:
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-package
+          path: .
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Deploy Bicep template for test
+        run: az deployment group create --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --template-file infra/main.bicep --parameters @infra/test.parameters.json
+      - name: Deploy app via zip to test
+        run: |
+          WEBAPP_NAME=$(python -c "import json,sys; print(json.load(open('infra/test.parameters.json'))['parameters']['webAppName']['value'])")
+          az webapp deployment source config-zip --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --name "$WEBAPP_NAME" --src package.zip
+      - name: Validate test endpoint
+        run: |
+          WEBAPP_NAME=$(python -c "import json,sys; print(json.load(open('infra/test.parameters.json'))['parameters']['webAppName']['value'])")
+          host="${WEBAPP_NAME}.azurewebsites.net"
+          echo "Waiting for https://$host to become healthy..."
+          for i in {1..15}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "https://$host" || echo 000)
+            echo "HTTP $status"
+            if [ "$status" -eq 200 ]; then echo "test healthy"; exit 0; fi
+            sleep 5
+          done
+          echo "test validation failed"; exit 1
+
+  deploy-prod:
+    runs-on: ubuntu-latest
+    needs: deploy-test
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-package
+          path: .
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Deploy Bicep template for prod
+        run: az deployment group create --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --template-file infra/main.bicep --parameters @infra/prod.parameters.json
+      - name: Deploy app via zip to prod
+        run: |
+          WEBAPP_NAME=$(python -c "import json,sys; print(json.load(open('infra/prod.parameters.json'))['parameters']['webAppName']['value'])")
+          az webapp deployment source config-zip --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --name "$WEBAPP_NAME" --src package.zip
+
+  validate-prod:
+    runs-on: ubuntu-latest
+    needs: deploy-prod
+    steps:
+      - name: Validate prod endpoint
+        run: |
+          WEBAPP_NAME=$(python -c "import json,sys; print(json.load(open('infra/prod.parameters.json'))['parameters']['webAppName']['value'])")
+          host="${WEBAPP_NAME}.azurewebsites.net"
+          echo "Waiting for https://$host to become healthy..."
+          for i in {1..15}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "https://$host" || echo 000)
+            echo "HTTP $status"
+            if [ "$status" -eq 200 ]; then echo "prod healthy"; exit 0; fi
+            sleep 5
+          done
+          echo "prod validation failed"; exit 1
