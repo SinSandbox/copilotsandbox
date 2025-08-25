@@ -1,4 +1,4 @@
-name: CI/CD: Build, test and promote (Bicep)
+name: "CI/CD: Build, test and promote (Bicep)"
 
 on:
   push:
